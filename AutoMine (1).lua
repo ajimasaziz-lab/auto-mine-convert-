@@ -13,11 +13,25 @@ local CONFIG = {
     START_RETRIES     = 2,      -- berapa kali F ditekan ulang kalau tombol "Stop Mining" tidak muncul
     SAFETY_MAX_MINE   = 120,    -- detik: batas pengaman kalau tombol "Stop Mining" tidak pernah hilang
     PICKUP_ENABLED    = true,   -- tekan F 1 kali setelah menambang untuk mengambil hasil yang jatuh
-    PICKUP_TEXT       = "picked up", -- teks notifikasi yang dihitung (tidak peka huruf besar/kecil)
+    PICKUP_TEXT       = "picked up", -- teks notifikasi ambil item (tidak peka huruf besar/kecil)
+
+    -- penghitung item
+    COUNT_ITEM_NAME       = "Gold Veined Quartz", -- hanya item ini yang dihitung (tidak peka huruf besar/kecil)
+    COUNT_REQUIRE_PICKUP  = true,   -- true = teks harus mengandung PICKUP_TEXT juga; false = cukup ada nama item
+    COUNT_PARSE_QTY       = true,   -- baca jumlah dari teks (mis. "x3" atau "3x"); kalau tidak ada dihitung 1
     DEFAULT_RADIUS    = 80,     -- radius (stud) untuk mode "terdekat koordinat"
     DONE_EXPIRE       = 180,    -- detik: ore yang dilewati (tidak terjangkau/gagal) tidak dipilih lagi
     MINED_EXPIRE      = 15,     -- detik: ore yang berhasil ditambang boleh dipilih lagi (kalau respawn)
     USE_PATHFINDING   = true,
+
+    -- kalkulasi rute: hitung rute ke ore DULU, baru bergerak (mengurangi nyangkut)
+    ROUTE_ENABLED     = true,   -- false = langsung jalan tanpa hitung rute dulu
+    ROUTE_DRAW        = true,   -- tampilkan garis rute
+    ROUTE_COLOR       = Color3.fromRGB(0, 255, 90), -- warna garis rute (hijau)
+    ROUTE_MAX_TRIES   = 3,      -- berapa kali rute dihitung ulang kalau gagal/nyangkut di tengah jalan
+    ROUTE_RING_RADIUS = 4,      -- stud: kalau titik ore tidak bisa dijangkau, coba titik di sekeliling ore pada jarak ini
+    ROUTE_RING_POINTS = 8,      -- jumlah titik alternatif di sekeliling ore
+    ROUTE_MAX_TIME    = 25,     -- detik: batas waktu mengikuti satu rute
 
     -- filter batas tak terlihat
     WALL_CHECK        = true,
@@ -76,7 +90,7 @@ local currentOre = nil
 local otherPosOn = true
 
 for _, o in ipairs(Workspace:GetChildren()) do
-    if o.Name == "AutoMine_CoordMarker" then o:Destroy() end
+    if o.Name == "AutoMine_CoordMarker" or o.Name == "AutoMine_RouteMarker" then o:Destroy() end
 end
 
 ----------------------------------------------------------------
@@ -131,7 +145,13 @@ local title = Instance.new("TextLabel", titleBar)
 title.Size = UDim2.new(1, -140, 1, 0)
 title.Position = UDim2.new(0, 12, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "Ditambang: 0"
+title.Text = CONFIG.COUNT_ITEM_NAME .. ": 0"
+title.TextScaled = true
+do
+    local c = Instance.new("UITextSizeConstraint", title)
+    c.MaxTextSize = 12
+    c.MinTextSize = 7
+end
 title.TextColor3 = COLORS.text
 title.Font = Enum.Font.GothamBold
 title.TextSize = 12
@@ -267,14 +287,29 @@ status.TextYAlignment = Enum.TextYAlignment.Top
 local function setStatus(t) status.Text = "Status: " .. t end
 
 local function updateCounter()
-    title.Text = ("Ditambang: %d"):format(minedCount)
+    title.Text = ("%s: %d"):format(CONFIG.COUNT_ITEM_NAME, minedCount)
 end
 updateCounter()
 
 -- hitung otomatis tiap muncul teks "picked up ..." di PlayerGui
 do
+    local itemLower = CONFIG.COUNT_ITEM_NAME:lower()
     local function textMatches(o)
-        return o.Text ~= "" and o.Text:lower():find(CONFIG.PICKUP_TEXT, 1, true) ~= nil
+        if o.Text == "" then return false end
+        local t = o.Text:lower()
+        if not t:find(itemLower, 1, true) then return false end
+        if CONFIG.COUNT_REQUIRE_PICKUP and not t:find(CONFIG.PICKUP_TEXT, 1, true) then return false end
+        return true
+    end
+
+    -- jumlah item dari teks: "x3" / "3x" / "x 3"; default 1
+    local function qtyOf(o)
+        if not CONFIG.COUNT_PARSE_QTY then return 1 end
+        local t = o.Text:lower()
+        local n = t:match("x%s*(%d+)") or t:match("(%d+)%s*x")
+        n = n and tonumber(n)
+        if n and n >= 1 and n <= 9999 then return n end
+        return 1
     end
 
     local lastCount = setmetatable({}, {__mode = "k"})
@@ -282,7 +317,7 @@ do
         local now = os.clock()
         if lastCount[o] and now - lastCount[o] < 0.3 then return end
         lastCount[o] = now
-        minedCount = minedCount + 1
+        minedCount = minedCount + qtyOf(o)
         updateCounter()
     end
 
@@ -987,6 +1022,110 @@ end
 ----------------------------------------------------------------
 -- Deteksi tombol "Mine" & "Stop Mining"
 ----------------------------------------------------------------
+----------------------------------------------------------------
+-- Kalkulasi rute (hitung dulu, gambar garis hijau, baru bergerak)
+----------------------------------------------------------------
+local routeFolder = nil
+
+local function clearRoute()
+    if routeFolder then
+        pcall(function() routeFolder:Destroy() end)
+        routeFolder = nil
+    end
+end
+
+local function drawRoute(route)
+    clearRoute()
+    if not CONFIG.ROUTE_DRAW or not route or #route < 2 then return end
+    routeFolder = Instance.new("Folder")
+    routeFolder.Name = "AutoMine_RouteMarker"
+    routeFolder.Parent = Workspace
+    local lift = Vector3.new(0, 0.6, 0)
+    local function mk(size, shape)
+        local part = Instance.new("Part")
+        part.Name = "AutoMine_RouteMarker"
+        part.Shape = shape or Enum.PartType.Block
+        part.Size = size
+        part.Anchored = true
+        part.CanCollide = false
+        part.CanQuery = false
+        part.CanTouch = false
+        part.CastShadow = false
+        part.Material = Enum.Material.Neon
+        part.Color = CONFIG.ROUTE_COLOR
+        part.Parent = routeFolder
+        return part
+    end
+    for i = 1, #route - 1 do
+        local a, b = route[i].pos + lift, route[i + 1].pos + lift
+        local len = (b - a).Magnitude
+        if len > 0.05 then
+            local seg = mk(Vector3.new(0.3, 0.3, len))
+            seg.CFrame = CFrame.lookAt((a + b) / 2, b)
+        end
+    end
+    for i = 1, #route do
+        local dot = mk(Vector3.new(0.7, 0.7, 0.7), Enum.PartType.Ball)
+        dot.Position = route[i].pos + lift
+    end
+end
+
+local function tryPath(from, dest)
+    local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true})
+    local ok = pcall(function() path:ComputeAsync(from, dest) end)
+    if ok and path.Status == Enum.PathStatus.Success then
+        local route = {}
+        for _, wp in ipairs(path:GetWaypoints()) do
+            table.insert(route, {pos = wp.Position, jump = (wp.Action == Enum.PathWaypointAction.Jump)})
+        end
+        if #route >= 2 then return route end
+    end
+    return nil
+end
+
+-- hitung rute dari posisi sekarang ke ore. Coba titik ore dulu, kalau gagal coba titik di sekeliling ore
+local function computeRoute(target)
+    local r = root()
+    if not r then return nil end
+    local from = r.Position
+    local route = tryPath(from, target)
+    if route then return route end
+
+    local cands = {}
+    for k = 1, CONFIG.ROUTE_RING_POINTS do
+        local ang = (k - 1) * (2 * math.pi / CONFIG.ROUTE_RING_POINTS)
+        table.insert(cands, Vector3.new(target.X + math.cos(ang) * CONFIG.ROUTE_RING_RADIUS, target.Y, target.Z + math.sin(ang) * CONFIG.ROUTE_RING_RADIUS))
+    end
+    table.sort(cands, function(a, b) return flatDist(a, from) < flatDist(b, from) end)
+    for i = 1, math.min(#cands, 4) do
+        if not running then return nil end
+        route = tryPath(from, cands[i])
+        if route then return route end
+    end
+    return nil
+end
+
+-- ikuti rute titik demi titik. return true kalau sampai ujung rute (atau dihentikan abortFn), false kalau nyangkut
+local function followRoute(route, abortFn, maxTime)
+    setCam(true)
+    local t0 = os.clock()
+    local ok = true
+    for i = 2, #route do
+        if not running then ok = false break end
+        if abortFn and abortFn() then break end
+        if os.clock() - t0 > maxTime then ok = false break end
+        local wp = route[i]
+        if wp.jump then tap(Enum.KeyCode.Space, 0.1) end
+        walkDirect(wp.pos, 3, 6, abortFn)
+        if abortFn and abortFn() then break end
+        local r = root()
+        if not r or flatDist(r.Position, wp.pos) > 6 then ok = false break end
+    end
+    releaseAll()
+    setCam(false)
+    return ok
+end
+
 local function scanGuiText(match)
     local pg = lp:FindFirstChildOfClass("PlayerGui")
     if not pg then return false end
@@ -1059,6 +1198,24 @@ local function approachOre(ore, id)
     invAt = 0
     if invalid() then return false end
     if waitButton(0.3) then return true end
+
+    -- 0. hitung rute dulu (garis hijau), baru bergerak; kalau nyangkut, hitung ulang dari posisi sekarang
+    if CONFIG.ROUTE_ENABLED then
+        for attempt = 1, CONFIG.ROUTE_MAX_TRIES do
+            if not running or left() <= 0 then break end
+            setStatus(("Ore #%d: menghitung rute (%d/%d)..."):format(id, attempt, CONFIG.ROUTE_MAX_TRIES))
+            local route = computeRoute(p)
+            if not route then break end             -- tidak ada rute: pakai cara bertahap di bawah
+            drawRoute(route)
+            setStatus(("Ore #%d: mengikuti rute (%d titik, sisa %ds)"):format(id, #route, math.max(0, math.floor(left()))))
+            local okr = followRoute(route, abort, math.min(left(), CONFIG.ROUTE_MAX_TIME))
+            invAt = 0
+            if invalid() then clearRoute() return false end
+            if waitButton(0.5) then clearRoute() return true end
+            if okr then break end                   -- rute selesai tapi tombol belum muncul: lanjut mendekat bertahap
+        end
+        clearRoute()
+    end
 
     -- 1. mendekat bertahap
     for _, d in ipairs({CONFIG.MINE_DISTANCE, 5, 3.5, 2.5, 1.5}) do
@@ -1175,6 +1332,7 @@ end
 
 local function mineOre(ore)
     mineOreInner(ore)
+    clearRoute()
     currentOre = nil
 end
 
@@ -1254,6 +1412,7 @@ local function toggleRun()
         running = false
         releaseAll()
         setCam(false)
+        clearRoute()
         setRunUI(false)
         setStatus("Dihentikan")
     end
@@ -1363,6 +1522,7 @@ local function stopAll()
     setCam(false)
     clearOreMarks()
     clearCoordMarker()
+    clearRoute()
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     connections = {}
     pcall(function() gui:Destroy() end)
