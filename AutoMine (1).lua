@@ -6,7 +6,7 @@ local CONFIG = {
     ORE_IGNORE_WORDS  = {"more", "core", "store", "explore", "restore", "score", "spore", "ignore", "before", "bore", "shore", "wore", "sore", "snore"}, -- nama berisi kata ini BUKAN ore
     MINE_KEY          = Enum.KeyCode.F,
     MINE_DISTANCE     = 7,
-    REACH_TIMEOUT     = 10,     -- detik: batas waktu menggapai tombol Mine (mendekat + memutari ore), lewat = ore dilewati (bisa diubah di menu)
+    REACH_TIMEOUT     = 30,     -- detik: batas waktu menggapai tombol Mine (mendekat + memutari ore), lewat = ore dilewati (bisa diubah di menu)
     AFTER_MINE_DELAY  = 1,      -- detik: jeda setelah menambang selesai sebelum ambil hasil (bisa diubah di menu)
     ACTION_WORDS      = {"mine", "mining"}, -- teks tombol aksi (muncul saat dekat ore). Tombol yang mengandung "stop" TIDAK dihitung
     STOP_TEXT         = "stop mining", -- teks tombol yang muncul selama menambang (tidak peka huruf besar/kecil)
@@ -20,7 +20,7 @@ local CONFIG = {
     COUNT_ITEM_NAME       = "Gold Veined Quartz", -- hanya item ini yang dihitung (tidak peka huruf besar/kecil)
     COUNT_REQUIRE_PICKUP  = true,   -- true = teks harus mengandung PICKUP_TEXT juga; false = cukup ada nama item
     COUNT_PARSE_QTY       = true,   -- baca jumlah dari teks (mis. "x3" atau "3x"); kalau tidak ada dihitung 1
-    DEFAULT_RADIUS    = 80,     -- radius (stud) untuk mode "terdekat koordinat"
+    DEFAULT_RADIUS    = 300,     -- radius (stud) untuk mode "terdekat koordinat"
     DONE_EXPIRE       = 180,    -- detik: ore yang dilewati (tidak terjangkau/gagal) tidak dipilih lagi
     MINED_EXPIRE      = 15,     -- detik: ore yang berhasil ditambang boleh dipilih lagi (kalau respawn)
     USE_PATHFINDING   = true,
