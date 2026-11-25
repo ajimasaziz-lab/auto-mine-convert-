@@ -1,5 +1,11 @@
---[[ AUTO MINE v2 (rekonstruksi dari AUTO CHOP v17: nambang Ore, tombol & alur sama dengan nebang)
-     v2: penomoran ore tetap per lokasi (tahan respawn), tidak ngulang dari 1 saat scan ulang ]]--
+--[[ AUTO MINE v3 (rekonstruksi dari AUTO CHOP v17: nambang Ore, tombol & alur sama dengan nebang)
+     v2: penomoran ore tetap per lokasi (tahan respawn), tidak ngulang dari 1 saat scan ulang
+     v3: - scan ulang otomatis tiap 20 detik (bisa diubah di menu), ore yang dilewati dicoba lagi setelah 20 detik
+         - titik koordinat bisa lebih dari 1 (TAMBAH TITIK), hapus 1 titik / hapus semua
+         - wilayah scan ditampilkan sebagai dinding kuning transparan di pinggir lingkaran;
+           lingkaran yang saling bertemu digabung (dinding di bagian yang tumpang tindih dihilangkan)
+         - perbaikan: spam print dihapus, loop ganda saat START/STOP cepat dicegah, memori ore lama dibersihkan,
+           error di loop utama tidak lagi membuat script macet diam-diam ]]--
 
 local CONFIG = {
     ORE_KEYWORDS      = {"ore"},  -- nama model/part ore mengandung salah satu kata ini (mis. "Iron Ore", "CopperOre")
@@ -20,13 +26,23 @@ local CONFIG = {
     COUNT_ITEM_NAME       = "Gold Veined Quartz", -- hanya item ini yang dihitung (tidak peka huruf besar/kecil)
     COUNT_REQUIRE_PICKUP  = true,   -- true = teks harus mengandung PICKUP_TEXT juga; false = cukup ada nama item
     COUNT_PARSE_QTY       = true,   -- baca jumlah dari teks (mis. "x3" atau "3x"); kalau tidak ada dihitung 1
-    DEFAULT_RADIUS    = 300,     -- radius (stud) untuk mode "terdekat koordinat"
-    DONE_EXPIRE       = 180,    -- detik: ore yang dilewati (tidak terjangkau/gagal) tidak dipilih lagi
+    DEFAULT_RADIUS    = 300,    -- radius (stud) tiap titik koordinat
+    RESCAN_INTERVAL   = 20,     -- detik: scan ulang otomatis selama berjalan (bisa diubah di menu)
+    DONE_EXPIRE       = 20,     -- detik: ore yang dilewati (tidak terjangkau/gagal) tidak dipilih lagi selama ini
     MINED_EXPIRE      = 15,     -- detik: ore yang berhasil ditambang boleh dipilih lagi (kalau respawn)
     USE_PATHFINDING   = true,
 
     -- penomoran tetap per lokasi
     SLOT_TOLERANCE    = 3,      -- stud: ore baru sedekat ini dari lokasi ore lama = memakai nomor lama (naikkan, mis. 6, kalau ore bergeser saat respawn)
+
+    -- titik koordinat & tampilan zona
+    POINT_MIN_GAP      = 2,     -- stud: titik baru sedekat ini dengan titik lama ditolak (duplikat)
+    ZONE_COLOR         = Color3.fromRGB(255, 215, 0), -- kuning
+    ZONE_TRANSPARENCY  = 0.65,  -- 0 = padat, 1 = tak terlihat
+    ZONE_WALL_HEIGHT   = 10,    -- stud: tinggi dinding zona
+    ZONE_WALL_THICK    = 0.4,   -- stud: tebal dinding zona
+    ZONE_SEGMENT_LEN   = 6,     -- stud: panjang tiap potongan dinding (makin kecil makin halus)
+    ZONE_MAX_SEGMENTS  = 240,   -- batas potongan per lingkaran
 
     -- kalkulasi rute: hitung rute ke ore DULU, baru bergerak (mengurangi nyangkut)
     ROUTE_ENABLED     = true,   -- false = langsung jalan tanpa hitung rute dulu
@@ -67,14 +83,20 @@ local env = (getgenv and getgenv()) or _G
 if env.__AutoMineStop then pcall(env.__AutoMineStop) end
 
 local running = false
+local runToken = 0
+local loopActive = false
 local scanning = false
+local pendingScan = false
 local needRescan = false
-local mode = "map"                   -- "map" = seluruh map | "coord" = terdekat koordinat
+local lastScanAt = 0
+local mode = "map"                   -- "map" = seluruh map | "coord" = di titik-titik koordinat
 local radius = CONFIG.DEFAULT_RADIUS
 local reachTimeout = CONFIG.REACH_TIMEOUT
 local afterMineDelay = CONFIG.AFTER_MINE_DELAY
-local coordPos = nil
-local coordParts = {}
+local rescanInterval = CONFIG.RESCAN_INTERVAL
+local coordPoints = {}               -- { {pos = Vector3}, ... }
+local zoneFolder = nil
+local patrolIdx = 0
 local minedCount = 0
 
 local oreId, nextId = {}, 1
@@ -118,17 +140,26 @@ local COLORS = {
     muted  = Color3.fromRGB(170, 175, 190),
     green  = Color3.fromRGB(46, 160, 80),
     red    = Color3.fromRGB(190, 55, 55),
+    orange = Color3.fromRGB(200, 120, 40),
     blue   = Color3.fromRGB(55, 105, 190),
     purple = Color3.fromRGB(110, 80, 190),
     accent = Color3.fromRGB(70, 200, 120),
 }
 
-local WIDTH, BAR_H, BODY_H = 260, 34, 428
+local WIDTH, BAR_H, BODY_H = 260, 34, 510
+-- tinggi area menu yang terlihat (bisa di-scroll kalau layar pendek, mis. HP)
+local BODY_VIEW = BODY_H
+do
+    local cam = Workspace.CurrentCamera
+    if cam then
+        BODY_VIEW = math.clamp(math.floor(cam.ViewportSize.Y - BAR_H - 80), 200, BODY_H)
+    end
+end
 
 local frame = Instance.new("Frame")
 frame.Name = "Main"
-frame.Size = UDim2.new(0, WIDTH, 0, BAR_H + BODY_H)
-frame.Position = UDim2.new(0, 20, 0.3, 0)
+frame.Size = UDim2.new(0, WIDTH, 0, BAR_H + BODY_VIEW)
+frame.Position = UDim2.new(0, 20, 0, 60)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.ClipsDescendants = true
@@ -180,30 +211,36 @@ local closeBtn = barBtn("×", -34, COLORS.red)
 local miniBtn = Instance.new("TextButton", titleBar)
 miniBtn.Size = UDim2.new(0, 54, 0, 22)
 miniBtn.Position = UDim2.new(1, -124, 0.5, -11)
-miniBtn.BackgroundColor3 = Color3.fromRGB(46, 160, 80)
+miniBtn.BackgroundColor3 = COLORS.green
 miniBtn.TextColor3 = Color3.new(1, 1, 1)
 miniBtn.Font = Enum.Font.GothamBold
 miniBtn.TextSize = 11
 miniBtn.Text = "START"
 Instance.new("UICorner", miniBtn).CornerRadius = UDim.new(0, 6)
 
-local body = Instance.new("Frame", frame)
-body.Size = UDim2.new(1, 0, 0, BODY_H)
+local body = Instance.new("ScrollingFrame", frame)
+body.Size = UDim2.new(1, 0, 0, BODY_VIEW)
 body.Position = UDim2.new(0, 0, 0, BAR_H)
 body.BackgroundTransparency = 1
+body.BorderSizePixel = 0
+body.CanvasSize = UDim2.new(0, 0, 0, BODY_H)
+body.ScrollBarThickness = 4
+body.ScrollingDirection = Enum.ScrollingDirection.Y
 
-local function mkBtn(text, y, color)
+local function mkBtnAt(text, x, y, w, color)
     local b = Instance.new("TextButton", body)
-    b.Size = UDim2.new(1, -20, 0, 30)
-    b.Position = UDim2.new(0, 10, 0, y)
+    b.Size = w and UDim2.new(0, w, 0, 30) or UDim2.new(1, -20, 0, 30)
+    b.Position = UDim2.new(0, x, 0, y)
     b.BackgroundColor3 = color
     b.TextColor3 = Color3.new(1, 1, 1)
     b.Font = Enum.Font.GothamBold
     b.TextSize = 12
+    b.TextWrapped = true
     b.Text = text
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
     return b
 end
+local function mkBtn(text, y, color) return mkBtnAt(text, 10, y, nil, color) end
 
 local function mkLabel(text, y)
     local l = Instance.new("TextLabel", body)
@@ -232,10 +269,29 @@ local function mkBox(y, text)
     return b
 end
 
-local startBtn = mkBtn("START", 8, COLORS.green)
-local coordBtn = mkBtn("PILIH KOORDINAT (posisi saya)", 44, COLORS.purple)
-local mapBtn   = mkBtn("TANDAI SELURUH MAP", 80, COLORS.field)
-local nearBtn  = mkBtn("TANDAI TERDEKAT KOORDINAT", 116, COLORS.field)
+local startBtn  = mkBtn("START", 8, COLORS.green)
+local coordBtn  = mkBtn("TAMBAH TITIK (posisi saya) [0]", 44, COLORS.purple)
+
+-- baris hapus titik: [no.] [HAPUS 1 TITIK] [HAPUS SEMUA]
+local delBox = Instance.new("TextBox", body)
+delBox.Size = UDim2.new(0, 46, 0, 30)
+delBox.Position = UDim2.new(0, 10, 0, 80)
+delBox.Text = ""
+delBox.PlaceholderText = "no."
+delBox.PlaceholderColor3 = Color3.fromRGB(120, 125, 140)
+delBox.BackgroundColor3 = COLORS.field
+delBox.TextColor3 = COLORS.text
+delBox.Font = Enum.Font.Gotham
+delBox.TextSize = 13
+delBox.ClearTextOnFocus = false
+Instance.new("UICorner", delBox).CornerRadius = UDim.new(0, 6)
+local delOneBtn = mkBtnAt("HAPUS 1 TITIK", 62, 80, 91, COLORS.orange)
+local delAllBtn = mkBtnAt("HAPUS SEMUA", 159, 80, 91, COLORS.red)
+delOneBtn.TextSize = 11
+delAllBtn.TextSize = 11
+
+local mapBtn    = mkBtn("TANDAI SELURUH MAP", 116, COLORS.field)
+local nearBtn   = mkBtn("TANDAI DI TITIK KOORDINAT", 152, COLORS.field)
 
 local function setRunUI(on)
     local txt = on and "STOP" or "START"
@@ -246,17 +302,19 @@ local function setRunUI(on)
     miniBtn.BackgroundColor3 = col
 end
 
-mkLabel("Radius koordinat (stud):", 156)
-local radiusBox = mkBox(153, radius)
-mkLabel("Batas raih Mine (detik):", 188)
-local reachBox = mkBox(185, reachTimeout)
-mkLabel("Jeda setelah tambang (detik):", 220)
-local mineBox = mkBox(217, afterMineDelay)
+mkLabel("Radius tiap titik (stud):", 192)
+local radiusBox = mkBox(189, radius)
+mkLabel("Batas raih Mine (detik):", 224)
+local reachBox = mkBox(221, reachTimeout)
+mkLabel("Jeda setelah tambang (detik):", 256)
+local mineBox = mkBox(253, afterMineDelay)
+mkLabel("Scan ulang tiap (detik):", 288)
+local rescanBox = mkBox(285, rescanInterval)
 
-mkLabel("Kecualikan no. ore:", 252)
+mkLabel("Kecualikan no. ore:", 320)
 local exBox = Instance.new("TextBox", body)
 exBox.Size = UDim2.new(1, -20, 0, 28)
-exBox.Position = UDim2.new(0, 10, 0, 274)
+exBox.Position = UDim2.new(0, 10, 0, 342)
 exBox.Text = ""
 exBox.PlaceholderText = "contoh: 3, 7, 10-15"
 exBox.PlaceholderColor3 = Color3.fromRGB(120, 125, 140)
@@ -267,12 +325,12 @@ exBox.TextSize = 13
 exBox.ClearTextOnFocus = false
 Instance.new("UICorner", exBox).CornerRadius = UDim.new(0, 6)
 
-local posBtn = mkBtn("DETEKSI POSISI PLAYER: ON", 310, COLORS.accent)
+local posBtn = mkBtn("DETEKSI POSISI PLAYER: ON", 378, COLORS.accent)
 posBtn.TextColor3 = Color3.fromRGB(10, 30, 15)
 
 local statusBox = Instance.new("Frame", body)
-statusBox.Size = UDim2.new(1, -20, 0, 70)
-statusBox.Position = UDim2.new(0, 10, 0, 348)
+statusBox.Size = UDim2.new(1, -20, 0, 84)
+statusBox.Position = UDim2.new(0, 10, 0, 416)
 statusBox.BackgroundColor3 = COLORS.bar
 statusBox.BorderSizePixel = 0
 Instance.new("UICorner", statusBox).CornerRadius = UDim.new(0, 8)
@@ -281,7 +339,7 @@ local status = Instance.new("TextLabel", statusBox)
 status.Size = UDim2.new(1, -16, 1, -8)
 status.Position = UDim2.new(0, 8, 0, 4)
 status.BackgroundTransparency = 1
-status.Text = "Status: pilih mode penandaan ore (seluruh map / terdekat koordinat)."
+status.Text = "Status: pilih mode penandaan ore (seluruh map / titik koordinat)."
 status.TextColor3 = COLORS.muted
 status.Font = Enum.Font.Gotham
 status.TextSize = 12
@@ -381,7 +439,7 @@ local minimized = false
 minBtn.MouseButton1Click:Connect(function()
     minimized = not minimized
     minBtn.Text = minimized and "+" or "–"
-    local h = minimized and BAR_H or (BAR_H + BODY_H)
+    local h = minimized and BAR_H or (BAR_H + BODY_VIEW)
     TweenService:Create(frame, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {Size = UDim2.new(0, WIDTH, 0, h)}):Play()
 end)
 
@@ -435,60 +493,145 @@ local function nameHas(n, words)
 end
 
 ----------------------------------------------------------------
--- Penanda koordinat (bola + lingkaran radius)
+-- Titik koordinat & zona (dinding kuning, lingkaran yang bertemu digabung)
 ----------------------------------------------------------------
+-- kelompokkan titik yang lingkarannya saling bertemu (jarak antar pusat <= 2 x radius)
+local function pointGroups()
+    local n = #coordPoints
+    local par = {}
+    for i = 1, n do par[i] = i end
+    local function find(i)
+        while par[i] ~= i do
+            par[i] = par[par[i]]
+            i = par[i]
+        end
+        return i
+    end
+    for i = 1, n do
+        for j = i + 1, n do
+            if flatDist(coordPoints[i].pos, coordPoints[j].pos) <= radius * 2 then
+                local a, b = find(i), find(j)
+                if a ~= b then par[b] = a end
+            end
+        end
+    end
+    local groupOf, groups, idx = {}, {}, {}
+    for i = 1, n do
+        local r = find(i)
+        if not idx[r] then
+            table.insert(groups, {})
+            idx[r] = #groups
+        end
+        groupOf[i] = idx[r]
+        table.insert(groups[idx[r]], i)
+    end
+    return groupOf, groups
+end
+
 local function clearCoordMarker()
-    for _, p in ipairs(coordParts) do p:Destroy() end
-    coordParts = {}
+    if zoneFolder then
+        pcall(function() zoneFolder:Destroy() end)
+        zoneFolder = nil
+    end
 end
 
 local function drawCoordMarker()
     clearCoordMarker()
-    if not coordPos then return end
-    local green = Color3.fromRGB(0, 255, 120)
+    if #coordPoints == 0 then return end
 
-    local ball = Instance.new("Part")
-    ball.Name = "AutoMine_CoordMarker"
-    ball.Shape = Enum.PartType.Ball
-    ball.Size = Vector3.new(2, 2, 2)
-    ball.Anchored = true
-    ball.CanCollide = false
-    ball.CanQuery = false
-    ball.CanTouch = false
-    ball.Material = Enum.Material.Neon
-    ball.Color = green
-    ball.Transparency = 0.3
-    ball.Position = coordPos
-    ball.Parent = Workspace
+    zoneFolder = Instance.new("Folder")
+    zoneFolder.Name = "AutoMine_CoordMarker"
+    zoneFolder.Parent = Workspace
 
-    local bb = Instance.new("BillboardGui", ball)
-    bb.Size = UDim2.new(0, 90, 0, 22)
-    bb.StudsOffset = Vector3.new(0, 3, 0)
-    bb.AlwaysOnTop = true
-    local tl = Instance.new("TextLabel", bb)
-    tl.Size = UDim2.new(1, 0, 1, 0)
-    tl.BackgroundTransparency = 1
-    tl.Text = "KOORDINAT"
-    tl.TextColor3 = green
-    tl.TextStrokeTransparency = 0.3
-    tl.Font = Enum.Font.GothamBold
-    tl.TextSize = 14
+    local col = CONFIG.ZONE_COLOR
+    local H = CONFIG.ZONE_WALL_HEIGHT
+    local function mkPart(size, shape)
+        local p = Instance.new("Part")
+        p.Name = "AutoMine_CoordMarker"
+        p.Shape = shape or Enum.PartType.Block
+        p.Size = size
+        p.Anchored = true
+        p.CanCollide = false
+        p.CanQuery = false
+        p.CanTouch = false
+        p.CastShadow = false
+        p.Material = Enum.Material.SmoothPlastic
+        p.Color = col
+        p.Transparency = CONFIG.ZONE_TRANSPARENCY
+        p.Parent = zoneFolder
+        return p
+    end
 
-    local ring = Instance.new("Part")
-    ring.Name = "AutoMine_CoordMarker"
-    ring.Shape = Enum.PartType.Cylinder
-    ring.Size = Vector3.new(0.3, radius * 2, radius * 2)
-    ring.Anchored = true
-    ring.CanCollide = false
-    ring.CanQuery = false
-    ring.CanTouch = false
-    ring.Material = Enum.Material.Neon
-    ring.Color = green
-    ring.Transparency = 0.88
-    ring.CFrame = CFrame.new(coordPos - Vector3.new(0, 2.5, 0)) * CFrame.Angles(0, 0, math.pi / 2)
-    ring.Parent = Workspace
+    local groupOf, groups = pointGroups()
+    local segs = math.clamp(math.floor(2 * math.pi * radius / CONFIG.ZONE_SEGMENT_LEN), 24, CONFIG.ZONE_MAX_SEGMENTS)
 
-    coordParts = {ball, ring}
+    for i, pt in ipairs(coordPoints) do
+        local c = pt.pos
+
+        -- bola penanda titik + label
+        local ball = mkPart(Vector3.new(2, 2, 2), Enum.PartType.Ball)
+        ball.Material = Enum.Material.Neon
+        ball.Transparency = 0.2
+        ball.Position = c
+
+        local g = groups[groupOf[i]]
+        local txt = ("TITIK %d"):format(i)
+        if #g > 1 then
+            local names = {}
+            for _, k in ipairs(g) do table.insert(names, tostring(k)) end
+            txt = txt .. " (gabung " .. table.concat(names, "+") .. ")"
+        end
+        local bb = Instance.new("BillboardGui", ball)
+        bb.Size = UDim2.new(0, 160, 0, 22)
+        bb.StudsOffset = Vector3.new(0, 3, 0)
+        bb.AlwaysOnTop = true
+        local tl = Instance.new("TextLabel", bb)
+        tl.Size = UDim2.new(1, 0, 1, 0)
+        tl.BackgroundTransparency = 1
+        tl.Text = txt
+        tl.TextColor3 = col
+        tl.TextStrokeTransparency = 0.3
+        tl.Font = Enum.Font.GothamBold
+        tl.TextSize = 14
+
+        -- dinding di pinggir lingkaran; potongan yang berada di dalam lingkaran titik lain dilewati (= digabung)
+        local midY = (c.Y - 3) + H / 2
+        for k = 0, segs - 1 do
+            local a0 = k * 2 * math.pi / segs
+            local a1 = (k + 1) * 2 * math.pi / segs
+            local p0 = Vector3.new(c.X + math.cos(a0) * radius, midY, c.Z + math.sin(a0) * radius)
+            local p1 = Vector3.new(c.X + math.cos(a1) * radius, midY, c.Z + math.sin(a1) * radius)
+            local mid = (p0 + p1) / 2
+            local inside = false
+            for j, o in ipairs(coordPoints) do
+                if j ~= i and flatDist(mid, o.pos) < radius - 0.05 then
+                    inside = true
+                    break
+                end
+            end
+            if not inside then
+                local len = (p1 - p0).Magnitude + 0.15
+                local w = mkPart(Vector3.new(CONFIG.ZONE_WALL_THICK, H, len))
+                w.CFrame = CFrame.lookAt(mid, mid + (p1 - p0))
+            end
+        end
+    end
+end
+
+-- titik terdekat yang lingkarannya memuat posisi p (nil kalau di luar semua lingkaran)
+local function pointCovering(p)
+    local best, bd
+    for _, pt in ipairs(coordPoints) do
+        local d = flatDist(p, pt.pos)
+        if d <= radius and (not bd or d < bd) then best, bd = pt.pos, d end
+    end
+    return best
+end
+
+local function areaCount()
+    if #coordPoints == 0 then return 0 end
+    local _, groups = pointGroups()
+    return #groups
 end
 
 ----------------------------------------------------------------
@@ -683,14 +826,15 @@ local function ensureMark(t)
     m.box.Color3 = tk and Color3.fromRGB(80, 160, 255) or Color3.fromRGB(255, 0, 0)
     m.box.SurfaceColor3 = m.box.Color3
     if m.label then
+        local id = oreId[t] or 0
         if ex then
-            m.label.Text = ("#%d X"):format(oreId[t])
+            m.label.Text = ("#%d X"):format(id)
             m.label.TextColor3 = Color3.fromRGB(255, 170, 60)
         elseif tk then
-            m.label.Text = ("#%d P"):format(oreId[t])
+            m.label.Text = ("#%d P"):format(id)
             m.label.TextColor3 = Color3.fromRGB(120, 180, 255)
         else
-            m.label.Text = ("#%d"):format(oreId[t])
+            m.label.Text = ("#%d"):format(id)
             m.label.TextColor3 = Color3.new(1, 1, 1)
         end
     end
@@ -745,8 +889,9 @@ local function rebuildCandidates()
     end
     local r = root()
     if r then
+        local rp = r.Position
         table.sort(keep, function(a, b)
-            return flatDist(posOf(a), r.Position) < flatDist(posOf(b), r.Position)
+            return flatDist(posOf(a), rp) < flatDist(posOf(b), rp)
         end)
     end
     ores = keep
@@ -814,16 +959,18 @@ local function isWallPart(d)
     return false
 end
 
-local function makeBlockedCheck(walls, ref)
-    if not CONFIG.WALL_CHECK or #walls == 0 or not ref then
+-- return fungsi(p, ref): true kalau ada dinding batas di antara ref dan p
+local function makeBlockedCheck(walls)
+    if not CONFIG.WALL_CHECK or #walls == 0 then
         return function() return false end
     end
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Include
     params.FilterDescendantsInstances = walls
     params.IgnoreWater = true
-    local origin = ref + Vector3.new(0, 3, 0)
-    return function(p)
+    return function(p, ref)
+        if not ref then return false end
+        local origin = ref + Vector3.new(0, 3, 0)
         local target = Vector3.new(p.X, origin.Y, p.Z)
         return Workspace:Raycast(origin, target - origin, params) ~= nil
     end
@@ -835,7 +982,7 @@ local function doScan()
     for _, d in ipairs(Workspace:GetDescendants()) do
         n = n + 1
         if n % 3000 == 0 then task.wait() end
-        if isOreName(d) and not isGroup(d)
+        if d.Parent and isOreName(d) and not isGroup(d)
             and not hasOreAncestor(d)
             and not (lp.Character and d:IsDescendantOf(lp.Character))
             and not (d:IsA("Model") and d:FindFirstChildOfClass("Humanoid")) then
@@ -844,7 +991,7 @@ local function doScan()
                 table.insert(all, d)
                 orePos[d] = p
             end
-        elseif CONFIG.WALL_CHECK and isWallPart(d) then
+        elseif CONFIG.WALL_CHECK and d.Parent and isWallPart(d) then
             table.insert(walls, d)
         end
     end
@@ -852,6 +999,13 @@ local function doScan()
     knownOres = all
     for t in pairs(orePos) do
         if not t.Parent then orePos[t] = nil trunkCache[t] = nil end
+    end
+    -- bersihkan data ore yang sudah dihapus game (mencegah memori terus membengkak)
+    for t in pairs(oreId) do
+        if not t.Parent then oreId[t] = nil oreH0[t] = nil end
+    end
+    for t in pairs(doneOres) do
+        if not t.Parent then doneOres[t] = nil end
     end
 
     attrIgnore = false
@@ -868,14 +1022,19 @@ local function doScan()
     -- 2. pilih sesuai mode
     local r = root()
     local playerPos = r and r.Position
-    local rayRef = (mode == "coord" and coordPos) or playerPos
-    local ref = rayRef or Vector3.zero
-    local isBlocked = makeBlockedCheck(walls, rayRef)
+    local isBlocked = makeBlockedCheck(walls)
     local outside = 0
     local selected = {}
     for _, t in ipairs(all) do
-        local ok = (mode == "map") or (coordPos ~= nil and flatDist(posOf(t), coordPos) <= radius)
-        if ok and isBlocked(posOf(t)) then
+        local p = posOf(t)
+        local ok, ref
+        if mode == "map" then
+            ok, ref = true, playerPos
+        else
+            ref = pointCovering(p)
+            ok = ref ~= nil
+        end
+        if ok and isBlocked(p, ref) then
             ok = false
             outside = outside + 1
         end
@@ -889,6 +1048,7 @@ local function doScan()
         if id then usedIds[id] = true end
     end
 
+    local ref = playerPos or (coordPoints[1] and coordPoints[1].pos) or Vector3.zero
     local fresh = {}
     for _, t in ipairs(selected) do
         if not oreId[t] then table.insert(fresh, t) end
@@ -929,23 +1089,36 @@ local function doScan()
 
     rebuildCandidates()
     updateMarks()
-    setStatus(("%s: %d ore | dikecualikan: %d | dipakai player lain: %d | di luar batas: %d | akan ditambang: %d")
-        :format(mode == "map" and "Seluruh map" or "Dekat koordinat",
-            #areaOres, countExcludedInArea(), countTakenInArea(), outside, #ores))
+    local where
+    if mode == "map" then
+        where = "Seluruh map"
+    else
+        where = ("%d titik / %d area"):format(#coordPoints, areaCount())
+    end
+    setStatus(("%s: %d ore | dikecualikan: %d | dipakai player lain: %d | di luar batas: %d | akan ditambang: %d | scan ulang tiap %ds")
+        :format(where, #areaOres, countExcludedInArea(), countTakenInArea(), outside, #ores, rescanInterval))
 end
 
 local function scanOres()
-    if scanning then return end
-    if mode == "coord" and not coordPos then
-        setStatus("Pilih koordinat dulu (tombol PILIH KOORDINAT).")
+    if scanning then
+        pendingScan = true
+        return
+    end
+    if mode == "coord" and #coordPoints == 0 then
+        setStatus("Tambahkan titik koordinat dulu (tombol TAMBAH TITIK).")
         return
     end
     scanning = true
     local ok, err = pcall(doScan)
     scanning = false
+    lastScanAt = os.clock()
     if not ok then
         warn("scanOres error:", err)
         setStatus("Scan gagal, coba lagi.")
+    end
+    if pendingScan then
+        pendingScan = false
+        if not running then task.spawn(scanOres) else needRescan = true end
     end
 end
 
@@ -975,6 +1148,7 @@ end
 ----------------------------------------------------------------
 local function setCam(on)
     local cam = camera()
+    if not cam then return end
     if on then
         if cam.CameraType == Enum.CameraType.Custom then
             cam.CameraType = Enum.CameraType.Scriptable
@@ -997,7 +1171,7 @@ local function walkDirect(target, stopDist, timeout, abortFn)
         local r = root()
         if not r then break end
         local flat = Vector3.new(target.X - r.Position.X, 0, target.Z - r.Position.Z)
-        if flat.Magnitude <= stopDist then break end
+        if flat.Magnitude <= stopDist or flat.Magnitude < 0.05 then break end
         if abortFn and abortFn() then break end
 
         local dir = flat.Unit
@@ -1159,7 +1333,6 @@ local function scanGuiText(match)
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("TextLabel")) and d.Text ~= "" then
             if match(d.Text:lower()) and guiShown(d, pg) then
-                print("MATCH:", d:GetFullName(), "|", d.Text)
                 return true
             end
         end
@@ -1291,7 +1464,7 @@ local function mineOreInner(ore)
             task.wait(0.5)
             finishOre(ore, CONFIG.OTHER_EXPIRE)
         else
-            setStatus(("Ore #%d tidak terjangkau (batas %d dtk), dilewati"):format(id, reachTimeout))
+            setStatus(("Ore #%d tidak terjangkau (batas %d dtk), dilewati %d dtk"):format(id, reachTimeout, CONFIG.DONE_EXPIRE))
             task.wait(0.8)
             finishOre(ore, CONFIG.DONE_EXPIRE)
         end
@@ -1359,7 +1532,11 @@ local function mineOreInner(ore)
 end
 
 local function mineOre(ore)
-    mineOreInner(ore)
+    local ok, err = pcall(mineOreInner, ore)
+    if not ok then
+        warn("mineOre error:", err)
+        finishOre(ore, CONFIG.DONE_EXPIRE)
+    end
     clearRoute()
     currentOre = nil
 end
@@ -1367,22 +1544,28 @@ end
 ----------------------------------------------------------------
 -- Loop utama
 ----------------------------------------------------------------
-local function mainLoop()
-    if mode == "coord" and not coordPos then
-        setStatus("Pilih koordinat dulu (tombol PILIH KOORDINAT).")
+local function alive(token) return running and token == runToken end
+
+local function mainLoopInner(token)
+    if mode == "coord" and #coordPoints == 0 then
+        setStatus("Tambahkan titik koordinat dulu (tombol TAMBAH TITIK).")
         running = false
         setRunUI(false)
         return
     end
     scanOres()
 
-    while running do
+    while alive(token) do
         if not root() then
             task.wait(1)
         else
             pruneMarks()
             refreshMarkStates()
-            if needRescan then needRescan = false scanOres() end
+            -- scan ulang otomatis tiap rescanInterval detik (default 20)
+            if needRescan or os.clock() - lastScanAt >= rescanInterval then
+                needRescan = false
+                scanOres()
+            end
 
             local target = nextOre()
             if target then
@@ -1391,7 +1574,7 @@ local function mainLoop()
                 else
                     mineOre(target)
                 end
-            elseif running then
+            elseif alive(token) then
                 local waiting = 0
                 for _, t in ipairs(ores) do
                     if t.Parent and not doneOres[t] and not isExcluded(t) then waiting = waiting + 1 end
@@ -1403,19 +1586,24 @@ local function mainLoop()
                     setStatus("Ore yang ditandai habis, scan ulang di area yang ditandai...")
                     task.wait(0.5)
                     scanOres()
-                    if #ores == 0 and running then
+                    if #ores == 0 and alive(token) then
+                        -- keliling ke titik koordinat berikutnya (bergiliran) supaya ore di sana termuat
                         local r = root()
-                        if mode == "coord" and coordPos and r and flatDist(r.Position, coordPos) > 8 then
-                            setStatus("Area kosong, kembali ke titik koordinat yang ditandai...")
-                            walkTo(coordPos, 4, 40)
-                            if running then
-                                task.wait(1)
-                                scanOres()
+                        if mode == "coord" and #coordPoints > 0 and r then
+                            patrolIdx = (patrolIdx % #coordPoints) + 1
+                            local dest = coordPoints[patrolIdx].pos
+                            if flatDist(r.Position, dest) > 8 then
+                                setStatus(("Area kosong, pindah ke titik %d dari %d..."):format(patrolIdx, #coordPoints))
+                                walkTo(dest, 4, 40)
+                                if alive(token) then
+                                    task.wait(1)
+                                    scanOres()
+                                end
                             end
                         end
                     end
-                    if #ores == 0 and running then
-                        setStatus("Tidak ada ore tersedia di area yang ditandai, menunggu ore muncul lagi...")
+                    if #ores == 0 and alive(token) then
+                        setStatus(("Tidak ada ore tersedia di area yang ditandai, scan ulang tiap %d dtk..."):format(rescanInterval))
                         task.wait(3)
                     end
                 end
@@ -1423,9 +1611,24 @@ local function mainLoop()
         end
         task.wait()
     end
+end
+
+local function mainLoop(token)
+    loopActive = true
+    local ok, err = pcall(mainLoopInner, token)
+    loopActive = false
     currentOre = nil
     releaseAll()
     setCam(false)
+    clearRoute()
+    if not ok then
+        warn("mainLoop error:", err)
+        if token == runToken then
+            running = false
+            setRunUI(false)
+            setStatus("Error, dihentikan: " .. tostring(err))
+        end
+    end
 end
 
 ----------------------------------------------------------------
@@ -1434,8 +1637,14 @@ end
 local function toggleRun()
     if not running then
         running = true
+        runToken = runToken + 1
+        local my = runToken
         setRunUI(true)
-        task.spawn(mainLoop)
+        task.spawn(function()
+            -- tunggu loop lama benar-benar berhenti (mencegah 2 loop jalan bersamaan)
+            while loopActive do task.wait(0.1) end
+            if running and my == runToken then mainLoop(my) end
+        end)
     else
         running = false
         releaseAll()
@@ -1448,20 +1657,66 @@ end
 startBtn.MouseButton1Click:Connect(toggleRun)
 miniBtn.MouseButton1Click:Connect(toggleRun)
 
-coordBtn.MouseButton1Click:Connect(function()
-    if running then setStatus("Hentikan (STOP) dulu sebelum ganti koordinat") return end
-    local r = root()
-    if not r then return end
-    coordPos = r.Position
+local function refreshPointUI()
+    coordBtn.Text = ("TAMBAH TITIK (posisi saya) [%d]"):format(#coordPoints)
+    nearBtn.Text = ("TANDAI DI TITIK KOORDINAT (%d titik / %d area)"):format(#coordPoints, areaCount())
+end
+refreshPointUI()
+
+-- dipanggil setiap titik ditambah / dihapus
+local function onPointsChanged(msg)
     drawCoordMarker()
-    coordBtn.Text = "KOORDINAT [OK] (klik utk ganti)"
+    refreshPointUI()
     if mode == "coord" then
-        resetNumbering()
-        setStatus("Koordinat baru disimpan, scanning...")
-        task.spawn(scanOres)
+        if #coordPoints == 0 then
+            if running then toggleRun() end
+            clearOreMarks()
+            areaOres, ores = {}, {}
+            setStatus(msg .. " Tidak ada titik tersisa, tambahkan titik baru atau pilih TANDAI SELURUH MAP.")
+            return
+        end
+        setStatus(msg .. " Scanning...")
+        if running then needRescan = true else task.spawn(scanOres) end
     else
-        setStatus(("Koordinat disimpan (X %.0f, Z %.0f). Klik TANDAI TERDEKAT KOORDINAT."):format(coordPos.X, coordPos.Z))
+        setStatus(msg .. " Klik TANDAI DI TITIK KOORDINAT untuk memakai titik.")
     end
+end
+
+coordBtn.MouseButton1Click:Connect(function()
+    local r = root()
+    if not r then setStatus("Karakter belum ada.") return end
+    local p = r.Position
+    for i, pt in ipairs(coordPoints) do
+        if flatDist(pt.pos, p) < CONFIG.POINT_MIN_GAP then
+            setStatus(("Posisi ini sudah jadi titik %d."):format(i))
+            return
+        end
+    end
+    table.insert(coordPoints, {pos = p})
+    onPointsChanged(("Titik %d ditambahkan (X %.0f, Z %.0f)."):format(#coordPoints, p.X, p.Z))
+end)
+
+delOneBtn.MouseButton1Click:Connect(function()
+    if #coordPoints == 0 then setStatus("Belum ada titik.") return end
+    local txt = delBox.Text:gsub("%s", "")
+    local n = (txt == "") and #coordPoints or tonumber(txt)   -- kosong = hapus titik terakhir
+    if not n or n ~= math.floor(n) or n < 1 or n > #coordPoints then
+        setStatus(("Nomor titik tidak valid. Isi 1 - %d (kosong = titik terakhir)."):format(#coordPoints))
+        return
+    end
+    table.remove(coordPoints, n)
+    delBox.Text = ""
+    patrolIdx = 0
+    onPointsChanged(("Titik %d dihapus (nomor titik lain disesuaikan)."):format(n))
+end)
+
+delAllBtn.MouseButton1Click:Connect(function()
+    if #coordPoints == 0 then setStatus("Belum ada titik.") return end
+    local n = #coordPoints
+    coordPoints = {}
+    delBox.Text = ""
+    patrolIdx = 0
+    onPointsChanged(("Semua titik (%d) dihapus."):format(n))
 end)
 
 mapBtn.MouseButton1Click:Connect(function()
@@ -1477,11 +1732,11 @@ end)
 nearBtn.MouseButton1Click:Connect(function()
     if running then setStatus("Hentikan (STOP) dulu sebelum ganti mode") return end
     if scanning then return end
-    if not coordPos then setStatus("Pilih koordinat dulu (tombol PILIH KOORDINAT).") return end
+    if #coordPoints == 0 then setStatus("Tambahkan titik koordinat dulu (tombol TAMBAH TITIK).") return end
     mode = "coord"
     refreshModeButtons()
     resetNumbering()
-    setStatus("Menandai ore terdekat koordinat...")
+    setStatus("Menandai ore di semua titik koordinat...")
     task.spawn(scanOres)
 end)
 
@@ -1516,8 +1771,9 @@ radiusBox.FocusLost:Connect(function()
     local n = tonumber(radiusBox.Text)
     if n and n >= 5 and n <= 5000 then
         radius = n
-        if coordPos then drawCoordMarker() end
-        if mode == "coord" then
+        drawCoordMarker()        -- gambar ulang zona (penggabungan dihitung ulang)
+        refreshPointUI()
+        if mode == "coord" and #coordPoints > 0 then
             if running then needRescan = true else task.spawn(scanOres) end
         end
     else
@@ -1543,8 +1799,19 @@ reachBox.FocusLost:Connect(function()
     end
 end)
 
+rescanBox.FocusLost:Connect(function()
+    local n = tonumber(rescanBox.Text)
+    if n and n >= 5 and n <= 600 then
+        rescanInterval = n
+        setStatus(("Scan ulang otomatis tiap %d detik."):format(n))
+    else
+        rescanBox.Text = tostring(rescanInterval)
+    end
+end)
+
 local function stopAll()
     running = false
+    runToken = runToken + 1
     currentOre = nil
     releaseAll()
     setCam(false)
