@@ -1158,7 +1158,10 @@ local function scanGuiText(match)
     if not pg then return false end
     for _, d in ipairs(pg:GetDescendants()) do
         if (d:IsA("TextButton") or d:IsA("TextLabel")) and d.Text ~= "" then
-            if match(d.Text:lower()) and guiShown(d, pg) then return true end
+            if match(d.Text:lower()) and guiShown(d, pg) then
+                print("MATCH:", d:GetFullName(), "|", d.Text)
+                return true
+            end
         end
     end
     return false
@@ -1167,10 +1170,8 @@ end
 local function isStopText(s) return s:find(CONFIG.STOP_TEXT, 1, true) ~= nil end
 local function isMineText(s)
     if s:find("stop", 1, true) then return false end
-    for _, w in ipairs(CONFIG.ACTION_WORDS) do
-        if s:find(w, 1, true) then return true end
-    end
-    return false
+    s = s:gsub("[^%a]", "")          -- buang spasi, simbol, "[F]"
+    return s == "mine" or s == "fmine"
 end
 
 local mineCache, mineCacheAt = false, 0
