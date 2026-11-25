@@ -1,11 +1,13 @@
---[[ AUTO MINE v3 (rekonstruksi dari AUTO CHOP v17: nambang Ore, tombol & alur sama dengan nebang)
+--[[ AUTO MINE v4 (rekonstruksi dari AUTO CHOP v17: nambang Ore, tombol & alur sama dengan nebang)
      v2: penomoran ore tetap per lokasi (tahan respawn), tidak ngulang dari 1 saat scan ulang
      v3: - scan ulang otomatis tiap 20 detik (bisa diubah di menu), ore yang dilewati dicoba lagi setelah 20 detik
          - titik koordinat bisa lebih dari 1 (TAMBAH TITIK), hapus 1 titik / hapus semua
          - wilayah scan ditampilkan sebagai dinding kuning transparan di pinggir lingkaran;
            lingkaran yang saling bertemu digabung (dinding di bagian yang tumpang tindih dihilangkan)
          - perbaikan: spam print dihapus, loop ganda saat START/STOP cepat dicegah, memori ore lama dibersihkan,
-           error di loop utama tidak lagi membuat script macet diam-diam ]]--
+           error di loop utama tidak lagi membuat script macet diam-diam
+     v4: - fungsi tunggu semua drop terambil dihapus, diganti WAKTU TUNGGU AMBIL DROP (bisa diatur di menu, default 4 detik)
+         - tombol RESET HITUNGAN untuk mengembalikan penghitung item ke 0 ]]--
 
 local CONFIG = {
     ORE_KEYWORDS      = {"ore"},  -- nama model/part ore mengandung salah satu kata ini (mis. "Iron Ore", "CopperOre")
@@ -20,6 +22,7 @@ local CONFIG = {
     START_RETRIES     = 2,      -- berapa kali F ditekan ulang kalau tombol "Stop Mining" tidak muncul
     SAFETY_MAX_MINE   = 120,    -- detik: batas pengaman kalau tombol "Stop Mining" tidak pernah hilang
     PICKUP_ENABLED    = true,   -- tekan F 1 kali setelah menambang untuk mengambil hasil yang jatuh
+    PICKUP_WAIT       = 4,      -- detik: waktu tunggu pengambilan drop setelah F ditekan (bisa diubah di menu)
     PICKUP_TEXT       = "picked up", -- teks notifikasi ambil item (tidak peka huruf besar/kecil)
 
     -- penghitung item
@@ -93,6 +96,7 @@ local mode = "map"                   -- "map" = seluruh map | "coord" = di titik
 local radius = CONFIG.DEFAULT_RADIUS
 local reachTimeout = CONFIG.REACH_TIMEOUT
 local afterMineDelay = CONFIG.AFTER_MINE_DELAY
+local pickupWait = CONFIG.PICKUP_WAIT
 local rescanInterval = CONFIG.RESCAN_INTERVAL
 local coordPoints = {}               -- { {pos = Vector3}, ... }
 local zoneFolder = nil
@@ -146,7 +150,7 @@ local COLORS = {
     accent = Color3.fromRGB(70, 200, 120),
 }
 
-local WIDTH, BAR_H, BODY_H = 260, 34, 510
+local WIDTH, BAR_H, BODY_H = 260, 34, 578
 -- tinggi area menu yang terlihat (bisa di-scroll kalau layar pendek, mis. HP)
 local BODY_VIEW = BODY_H
 do
@@ -310,11 +314,13 @@ mkLabel("Jeda setelah tambang (detik):", 256)
 local mineBox = mkBox(253, afterMineDelay)
 mkLabel("Scan ulang tiap (detik):", 288)
 local rescanBox = mkBox(285, rescanInterval)
+mkLabel("Tunggu ambil drop (detik):", 320)
+local pickupBox = mkBox(317, pickupWait)
 
-mkLabel("Kecualikan no. ore:", 320)
+mkLabel("Kecualikan no. ore:", 352)
 local exBox = Instance.new("TextBox", body)
 exBox.Size = UDim2.new(1, -20, 0, 28)
-exBox.Position = UDim2.new(0, 10, 0, 342)
+exBox.Position = UDim2.new(0, 10, 0, 374)
 exBox.Text = ""
 exBox.PlaceholderText = "contoh: 3, 7, 10-15"
 exBox.PlaceholderColor3 = Color3.fromRGB(120, 125, 140)
@@ -325,12 +331,14 @@ exBox.TextSize = 13
 exBox.ClearTextOnFocus = false
 Instance.new("UICorner", exBox).CornerRadius = UDim.new(0, 6)
 
-local posBtn = mkBtn("DETEKSI POSISI PLAYER: ON", 378, COLORS.accent)
+local posBtn = mkBtn("DETEKSI POSISI PLAYER: ON", 410, COLORS.accent)
 posBtn.TextColor3 = Color3.fromRGB(10, 30, 15)
+
+local resetBtn = mkBtn("RESET HITUNGAN", 446, COLORS.orange)
 
 local statusBox = Instance.new("Frame", body)
 statusBox.Size = UDim2.new(1, -20, 0, 84)
-statusBox.Position = UDim2.new(0, 10, 0, 416)
+statusBox.Position = UDim2.new(0, 10, 0, 484)
 statusBox.BackgroundColor3 = COLORS.bar
 statusBox.BorderSizePixel = 0
 Instance.new("UICorner", statusBox).CornerRadius = UDim.new(0, 8)
@@ -1522,9 +1530,14 @@ local function mineOreInner(ore)
         setStatus(("Ore #%d selesai, jeda %.1f dtk..."):format(id, afterMineDelay))
         task.wait(afterMineDelay)
         if CONFIG.PICKUP_ENABLED and running and not isExcluded(ore) then
-            setStatus(("Ore #%d: ambil hasil (F x1)..."):format(id))
+            -- ambil hasil: F 1 kali, lalu tunggu sesuai waktu di menu (tidak menunggu semua drop terambil)
             tap(CONFIG.MINE_KEY, 0.05)
-            task.wait(0.6)
+            local pt0 = os.clock()
+            while running and os.clock() - pt0 < pickupWait do
+                local left = math.max(0, pickupWait - (os.clock() - pt0))
+                setStatus(("Ore #%d: ambil drop (F x1), tunggu %.1f dtk..."):format(id, left))
+                task.wait(0.1)
+            end
         end
     end
 
@@ -1788,6 +1801,22 @@ mineBox.FocusLost:Connect(function()
     else
         mineBox.Text = tostring(afterMineDelay)
     end
+end)
+
+pickupBox.FocusLost:Connect(function()
+    local n = tonumber(pickupBox.Text)
+    if n and n >= 0 and n <= 60 then
+        pickupWait = n
+        setStatus(("Waktu tunggu ambil drop: %s detik."):format(tostring(n)))
+    else
+        pickupBox.Text = tostring(pickupWait)
+    end
+end)
+
+resetBtn.MouseButton1Click:Connect(function()
+    minedCount = 0
+    updateCounter()
+    setStatus("Hitungan " .. CONFIG.COUNT_ITEM_NAME .. " direset ke 0.")
 end)
 
 reachBox.FocusLost:Connect(function()
