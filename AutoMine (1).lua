@@ -1,4 +1,5 @@
---[[ AUTO MINE v1 (rekonstruksi dari AUTO CHOP v17: nambang Ore, tombol & alur sama dengan nebang) ]]--
+--[[ AUTO MINE v2 (rekonstruksi dari AUTO CHOP v17: nambang Ore, tombol & alur sama dengan nebang)
+     v2: penomoran ore tetap per lokasi (tahan respawn), tidak ngulang dari 1 saat scan ulang ]]--
 
 local CONFIG = {
     ORE_KEYWORDS      = {"ore"},  -- nama model/part ore mengandung salah satu kata ini (mis. "Iron Ore", "CopperOre")
@@ -23,6 +24,9 @@ local CONFIG = {
     DONE_EXPIRE       = 180,    -- detik: ore yang dilewati (tidak terjangkau/gagal) tidak dipilih lagi
     MINED_EXPIRE      = 15,     -- detik: ore yang berhasil ditambang boleh dipilih lagi (kalau respawn)
     USE_PATHFINDING   = true,
+
+    -- penomoran tetap per lokasi
+    SLOT_TOLERANCE    = 3,      -- stud: ore baru sedekat ini dari lokasi ore lama = memakai nomor lama (naikkan, mis. 6, kalau ore bergeser saat respawn)
 
     -- kalkulasi rute: hitung rute ke ore DULU, baru bergerak (mengurangi nyangkut)
     ROUTE_ENABLED     = true,   -- false = langsung jalan tanpa hitung rute dulu
@@ -74,6 +78,7 @@ local coordParts = {}
 local minedCount = 0
 
 local oreId, nextId = {}, 1
+local oreSlots = {}                  -- {pos, id}: nomor tetap per lokasi ore (tahan respawn)
 local oreH0, doneOres = {}, {}
 local excluded = {}
 local areaOres, ores = {}, {}
@@ -784,6 +789,7 @@ end
 local function resetNumbering()
     clearOreMarks()
     oreId, nextId, oreH0, doneOres = {}, 1, {}, {}
+    oreSlots = {}
     areaOres, ores = {}, {}
     excluded = {}
     exBox.Text = ""
@@ -876,7 +882,13 @@ local function doScan()
         if ok then table.insert(selected, t) end
     end
 
-    -- 3. beri nomor ore yang belum bernomor (terdekat dari titik acuan = nomor kecil)
+    -- 3. beri nomor: ore hasil respawn di lokasi lama memakai nomor lama
+    local usedIds = {}
+    for _, t in ipairs(all) do
+        local id = oreId[t]
+        if id then usedIds[id] = true end
+    end
+
     local fresh = {}
     for _, t in ipairs(selected) do
         if not oreId[t] then table.insert(fresh, t) end
@@ -885,8 +897,23 @@ local function doScan()
         return flatDist(posOf(a), ref) < flatDist(posOf(b), ref)
     end)
     for _, t in ipairs(fresh) do
-        oreId[t] = nextId
-        nextId = nextId + 1
+        local p = posOf(t)
+        local id, bestD
+        for _, s in ipairs(oreSlots) do
+            if not usedIds[s.id] then
+                local d = (s.pos - p).Magnitude
+                if d <= CONFIG.SLOT_TOLERANCE and (not bestD or d < bestD) then
+                    id, bestD = s.id, d
+                end
+            end
+        end
+        if not id then
+            id = nextId
+            nextId = nextId + 1
+            table.insert(oreSlots, {pos = p, id = id})
+        end
+        usedIds[id] = true
+        oreId[t] = id
         oreH0[t] = oreHeight(t)
     end
 
@@ -1020,9 +1047,6 @@ local function walkTo(target, stopDist, timeout, abortFn)
 end
 
 ----------------------------------------------------------------
--- Deteksi tombol "Mine" & "Stop Mining"
-----------------------------------------------------------------
-----------------------------------------------------------------
 -- Kalkulasi rute (hitung dulu, gambar garis hijau, baru bergerak)
 ----------------------------------------------------------------
 local routeFolder = nil
@@ -1126,6 +1150,9 @@ local function followRoute(route, abortFn, maxTime)
     return ok
 end
 
+----------------------------------------------------------------
+-- Deteksi tombol "Mine" & "Stop Mining"
+----------------------------------------------------------------
 local function scanGuiText(match)
     local pg = lp:FindFirstChildOfClass("PlayerGui")
     if not pg then return false end
